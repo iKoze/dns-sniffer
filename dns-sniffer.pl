@@ -5,7 +5,6 @@
 # Logdateien.
 #
 # Benötigte Programme:
-# - tcpdump
 # - mkdir
 #
 # Dateiformat:
@@ -24,12 +23,6 @@
 # | ?h?		| Stunde	| sub dt	|
 # | ?m?		| Minute	| sub dt	|
 # | ?s?		| Sekunde	| sub dt	|
-# | ?pY?	| Jahr		| tcpdump	|
-# | ?pM?	| Monat		| tcpdump	|
-# | ?pD?	| Tag		| tcpdump	|
-# | ?ph?	| Stunde	| tcpdump	|
-# | ?pm?	| Minute	| tcpdump	|
-# | ?ps?	| Sekunde	| tcpdump	|
 # | ?type?	| Typ(A,MX,...)	| tcpdump	|
 # | ?subdomain?	| Subdomain	| tcpdump	|
 # | ?domain?	| Domain	| tcpdump	|
@@ -63,14 +56,28 @@
 #		Pidfile und startoptionen implementiert.
 # 23-24.5.2013:	Florian Schießl:
 #		Multithreading implementiert.
-#
+# 27.5.2013:	Florian Schießl:
+#		Umstieg von tcpdump auf Pcap.
+# 28.5.2013:	Florian Schießl:
+#		Optimierungen und Ausgabe der Anfragen/sec in 
+#		den Performance-Daten
 ##############################################################
-use Sys::Hostname;
-use POSIX "setsid";
-use Getopt::Long qw( :config no_ignore_case bundling );
-use threads;
-use Thread::Queue;
-use threads::shared;
+use strict; # Guter Stil
+use Try::Tiny; # Error-Catching
+use Sys::Hostname; # Hostname
+use POSIX "setsid"; # Daemonizen
+use Getopt::Long qw( :config no_ignore_case bundling ); # Aufruf-Parameter
+# Threading
+use threads; # Threads
+use threads::shared; # Zwischen den Threads geteilte Variablen
+use Thread::Queue; # FIFO Warteschlange für Objekte
+# Sniffing
+use Net::PcapUtils; # Sniffer
+use NetPacket::Ethernet qw ( :types ); # Ethernet-Paket
+use NetPacket::IP qw ( :protos :versions ); # IP-Paket
+use NetPacket::UDP; # UDP-Paket
+use NetPacket::TCP; # TCP-Paket
+use Net::DNS::Packet; # DNS-Paket
 ##############################################################
 # Konfiguration
 #
@@ -78,11 +85,11 @@ use threads::shared;
 ######################
 # Logrotate-Stunden
 # Zu welcher Stunde ?rot? um eins erhöht wird.
-# Auskommentieren, falls es nicht gebraucht wird.
-#my @rotatehours = (6,12,18,24); # Muss 24 enthalten!
+my $userotation = 0; # 1 = Rotation benutzen, 0 = nicht.
+my @rotatehours = (6,12,18,24); # Muss 24 enthalten!
 
-##############
-# Dateiname
+#######################
+# Dateiname / Format
 # Nicht vorhandene Dateien/Ordner werden automatisch erstellt
 my $filename = "/var/log/dnstest/?host?_?Y?-?M?-?D?.log";
 
@@ -90,17 +97,17 @@ my $filename = "/var/log/dnstest/?host?_?Y?-?M?-?D?.log";
 # Dateiinhalt für eine DNS-Anfrage
 my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain?\n";
 
+########################################
+# wenn Subdomain leer, ersetzen durch
+my $nosubdomain = "";
+
 ###############################
 # IP, auf der gelauscht wird
 my $listenip = "";
 
 ######################################
 # Interface, auf dem gelauscht wird
-my $listenif = "eth0";
-
-########################################
-# wenn Subdomain leer, ersetzen durch
-my $nosubdomain = "";
+#my $listenif = "eth0";
 
 ###################################################################
 # Falls benötigt, zusätzliche Parser Threads (einer läuft immer)
@@ -110,8 +117,8 @@ my $extraparsers = 0;
 # Debugging; 0 = nichts ausgeben; 1 = nur Fehler; 2 = Fehler & Anfragen; 3 = alles
 my $debug = 0;
 
-###########################################
-# Performance-Daten auf STDERR schreiben
+################################################################################################
+# Performance-Daten auf STDERR schreiben; 0 = nichts ausgeben; 1 = performance daten ausgeben
 my $perfdata = 0;
 
 #############################################################
@@ -120,8 +127,6 @@ my $flush = 20;
 
 ###################
 # Hilfsprogramme
-my $tcpdump = "tcpdump";		# Pfad zu tcpdump
-my $tcpdumpoptions = "-l";	# CentOS kompatibel machen ;-)
 my $mkdir = "mkdir";		# Pfad zu mkdir
 my $syslog = "logger";		# Pfad zu Syslog (Für Start/Stop Nachrichten)
 
@@ -129,153 +134,172 @@ my $syslog = "logger";		# Pfad zu Syslog (Für Start/Stop Nachrichten)
 # Start
 #
 
-
 # Variablen belegen
 my $daemonize = 0; # 1 = Daemon; 0 = Normal
-my $pidfile = "";
+my $pidfile = ""; # Pid Datei dieses Prozesses
+my $hostname = hostname;
+my $reqpersec :shared = 0; # Anfragen / Sekunde (zwischen Threads geteilte Variable)
+my $parsequeue = Thread::Queue->new(); # Eingangswarteschlange
+my $writequeue = Thread::Queue->new(); # Schreibwarteschlange
+
+# Optionen holen
 GetOptions(
 	'd|daemon' => \$daemonize,
 	'p|pidfile:s' => \$pidfile
 );
-my $hostname = hostname;
-my $parsequeue :shared = Thread::Queue->new();
-my $writequeue :shared = Thread::Queue->new();
-threads->new(\&perfdata)->detach if defined($perfdata) && $perfdata != 0;
-my $fileref;
-my $currentfile = "";
+
 
 # Konfiguration überprüfen
-if(@rotatehours)
+if($userotation == 1)
 {
 	@rotatehours = sort {$a <=> $b} (@rotatehours); # Rotations-Stunden Numerisch aufsteigend sortieren
 	&validaterotation; # rotatehours Konfiguration validieren
 }
 
 # Starten
-my $execute = "$tcpdump $tcpdumpoptions -tttt -i $listenif dst port 53 and dst host $listenip";
-&debug(3,"[debug(execute)]: $execute\n");
-&daemonize if $daemonize == 1;
-my $pid;
-$pid = open(INPUT, "-|"); # Fork here
-defined($pid) or &stirb("Can't fork!", 2);
+&daemonize if $daemonize == 1; # Daemon werden
 
-if(!$pid)
-{
-	# Child (tcpdump)
-	&debug(3,"[debug(child)]: started.\n");
-	#exec("sleep 300000");
-	exec($execute) or &stirb("Can't open tcpdump. (Are you root?)", 2);
-}
+# Threads Starten
+threads->new(\&perfdata)->detach if defined($perfdata) && $perfdata != 0; # Perfdata-Thread starten
+my $writer = threads->new(\&writer); # Writer-Thread starten
+threads->new(\&parser)->detach; # Parser-Thread starten
 
-my $writer = threads->new(\&writer);
-
-threads->new(\&parser)->detach;
+# Zusätzliche Parser Threads starten (Sofern gewünscht)
 for(my $i = 0; $i < $extraparsers; $i++)
 {
 	threads->new(\&parser)->detach;
 }
 
+##############################################################
+# Erfolgreich gestartet!
+#
+
 &syslog("successfully started.");
+
+# Pidfile schreiben
 if($pidfile ne '')
 {
-	# Pidfile schreiben
-#	system($echo.' '.$$.' > '.$pidfile);
 	open(PIDFILE,">$pidfile") or die $!;
 	print PIDFILE $$;
 	close PIDFILE;
 	&syslog("pidfile '".$pidfile."' created");
 }
-# Catching Signals
+
+# Beenden-Signale abfangen (wichtig für clean-shutdown!)
 $SIG{INT} = \&exittsk;
 $SIG{TERM} = \&exittsk;
 $SIG{QUIT} = \&exittsk;
 $SIG{ABRT} = \&exittsk;
 $SIG{HUP} = \&exittsk;
 
-while(<INPUT>)
+# Sniffen starten.
+# Alle Pakete werden mit sub input bearbeitet.
+Net::PcapUtils::loop(\&input, FILTER => 'dst port 53 and dst host '.$listenip); 
+&stirb("Can't start listening!",2); # Dieser Punkt darf nicht erreicht werden!
+
+
+# Hier (sub input) kommen die gesnifferten Pakete an.
+# Um das blocken des Sniffers zu verhindern, werden alle ankommenden Pakete
+# in die $parsequeue (Eingangswarteschlange) gesteckt, wo sie darauf warten, 
+# von einem Parser bearbeitet zu werden.
+sub input
 {
-	# Alles was rein kommt den Parsern überlassen
-	$parsequeue->enqueue($_);
+	my ($user_data, $hdr, $packet) = @_; # Nur $packet wird gebraucht.
+	$parsequeue->enqueue($packet); # Das Paket in die $parsequeue stecken.
 }
-close INPUT;
-&stirb("end of INPUT (tcpdump died?)", 2);
+
 
 ############
 # Threads
 
-# Der Parser Thread holt alle Infos aus einer tcpdump Eingabe und baut daraus
-# eine Zeile der Logdatei. Danach wird die Zeile dem Writer Thread übergeben.
+############
+# Parser:
+# Ein Parser-Thread wartet auf neue Pakete in der $parsequeue. Erscheint dort ein neues Paket,
+# so wird es herausgenommen und verarbeitet. Nach der Verarbeitung kommt der aus dem Paket 
+# gewonnene String zusammen mit dem Dateiname in die $writequeue (Schreibwarteschlange), wo 
+# er darauf wartet, vom Writer-Thread in seine dazugehörige Datei geschrieben zu werden.
 sub parser
 {
 	&debug(3,"[debug(parser-thread)]: started.\n");
-#	$SIG{INT} = sub 
-#	{
-#		&debug(3,"[thread(parser)]: exited.\n");
-#		threads->exit();
-#	};
-
-	while(my $_ = $parsequeue->dequeue())
+	
+	# Auf Pakete in der $parsequeue warten und herausnehmen.
+	PACKET: while(my $packet = $parsequeue->dequeue())
 	{
-		# Nur um auf Nummer Sicher zu gehen
-		undef $time;
-		undef $type;
-		undef $fqdn;
-		undef @fqdnparts;
-		undef $domain;
-		undef $subdomain;
-		undef $line;
-	
-		chomp; # Zeilenumbruch entfernen
-
-		# Ich versuche alles so genau wie möglich zu matchen,
-		# um keine falschen Daten zu bekommen. Alles was zu viel
-		# gematcht wurde entferne ich in den Schritten darauf.
-		# Beispiel Input String:
-		# "2012-10-10 15:48:10.182596 IP 193.254.174.37.53356 > ns2.trans.net.domain: 62986 [1au] A? ad.71i.de. (38)"
-
-		# Zeit extrahieren
-		if($_ =~ m/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+ IP /)
+		my $type;
+		my $fqdn;
+		
+		##########################
+		# Das Paket verarbeiten
+		
+		# Sensiblen Bereich absichern mit try/catch
+		try
 		{
-			$datetime = $&; # "2012-10-10 15:48:10.182596 IP "
-			$datetime =~ s/\.[0-9]+ IP //; # "15:48:10"
+			no warnings 'exiting'; # Wir wissen, dass wir mit einem next den try block verlassen.
+			
+			# Ethernet-Frame decodieren (OSI 2)
+			my $eth_frame = NetPacket::Ethernet->decode($packet);
+			# Verwerfen falls kein IP-Paket
+			next PACKET if $eth_frame->{type} != ETH_TYPE_IP && $eth_frame->{type} != ETH_TYPE_IPv6;
+			
+			# IP-Paket decodieren (OSI 3)
+			my $ip_frame = NetPacket::IP->decode($eth_frame->{data});
+			# Verwerfen falls nicht TCP oder UDP
+			next PACKET if $ip_frame->{proto} != IP_PROTO_TCP && $ip_frame->{proto} != IP_PROTO_UDP;
+		
+			my $dnspacket;
+		
+			# IPv4
+			if($ip_frame->{ver} == IP_VERSION_IPv4)
+			{
+				# TCP Anfragen (OSI 4)
+				if($ip_frame->{proto} == IP_PROTO_TCP)
+				{
+					# TCP-Frame decodieren
+					my $tcp_frame = NetPacket::TCP->decode($ip_frame->{data});
+					next PACKET unless $tcp_frame;
+					# DNS-Paket aus Datenteil erzeugen
+					$dnspacket = Net::DNS::Packet->new(\$tcp_frame->{data});
+				}
+			
+				# UDP Anfragen (OSI 4)
+				if($ip_frame->{proto} == IP_PROTO_UDP)
+				{
+					# UDP-Frame decodieren
+					my $udp_frame = NetPacket::UDP->decode($ip_frame->{data});
+					next PACKET unless $udp_frame;
+					# DNS-Paket aus Datenteil erzeugen
+					$dnspacket = Net::DNS::Packet->new(\$udp_frame->{data});
+				}
+			}
+			
+			
+			next PACKET unless $dnspacket; # Verwerfen, falls kein DNS-Paket
+			my ($dnsquestion) = $dnspacket->question;
+			next PACKET unless $dnsquestion; # Verwerfen, falls keine DNS-Anfrage
+			
+			# Typ (A, AAAA, MX, NS,...) extrahieren
+			$type = $dnsquestion->qtype;
+			# FQDN extrahieren
+			$fqdn = $dnsquestion->qname;
 		}
-		else
+		catch
 		{
-			&debug(1,"[errline(nodate)]: $_ \n");
-			next;
-		}
-	
-		# Typ extrahieren
-		if($_ =~ m/ [A-Z]+\? /)
-		{
-			$type = $&; # " A? "
-			$type =~ s/\? $//; # " A"
-			$type =~ s/^ //; # "A"
-		}
-		else
-		{
-			&debug(1,"[errline(notype)]: $_ \n");
-			next;
-		}
-	
-		# FQDN extrahieren
-		if($_ =~ m/\? .+\. \([0-9]+\)$/)
-		{
-			$fqdn = $&; # "? ad.71i.de. (38)"
-			$fqdn =~ s/^\? //; # "ad.71i.de. (38)"
-			$fqdn =~ s/\. \([0-9]+\)$//; # "ad.71i.de"
-			$fqdn = lc $fqdn; # die Gross-/Kleinschreibung von Domains interessiert niemanden
-		}
-		else
-		{
-			&debug(1,"[errline(nofqdn)]: $_ \n");
-			next;
-		}
-	
+			# Sollte nicht auftreten aber sicher ist sicher.
+			# (Besser als den Thread abschmieren zu lassen) ;-)
+			no warnings 'exiting';
+			&debug(1, $_."\n");
+			next PACKET;
+		};
+		
+		###############################
 		# Erste Aufbereitung fertig.
-
+		
 		# Subdomain und Domain extrahieren.
-		@fqdnparts = split('\.',$fqdn); # den fqdn nach Punkten aufteilen
+		my @fqdnparts = split('\.',$fqdn); # den FQDN an den Punkten aufteilen
+		
+		# Beispiel: "www.sub.example.com"
+		my $domain; # Die Domain bis zum 2. Level (z.B. "example.com")
+		my $subdomain; # Die Subdomain (z.B. "www.sub")
 		if($#fqdnparts > 1)
 		{
 			# Domain mit Subdomain
@@ -289,30 +313,37 @@ sub parser
 		}
 		else
 		{
-			&debug(1,"[errline(invalidDomain)]: $_ \n");
+			# Ungültige Domain
+			&debug(1,"[err(invalidDomain)]: $fqdn \n");
 			next;
 		}
-	
-		# Jahr, Monat, Tag, Stunde, Minute, Sekunde aus den Paketen extrahieren.
-		($date,$time) = split(' ',$datetime);
-		($pyear,$pmonth,$pday) = split('-',$date);
-		($phour,$pminute,$psecond) = split(':',$time);
-
-		# Aufbereitung abgeschlossen, alle Text-Variablen mit Werten belegt
-		my $line = &replacevars($pattern);
-	
-		&debug(2,"$line");
 		
-		# An Writer übergeben
-		my @info = (&replacevars($filename),$line);
+		################################
+		# Aufbereitung abgeschlossen.
+		
+		# Einen String für die Logdatei anhand des Musters ($pattern) erstellen
+		my $line = &replacevars($pattern, $type, $subdomain, $domain);
+		
+		# Info für die Schreibwarteschlange ($writequeue) erstellen
+		my @info;
+		$info[0] = &replacevars($filename, $type, $subdomain, $domain); # Dateiname
+		$info[1] = $line; # Logdatei-String
+		
+		# Info für Writer in Schreibwarteschlange stecken.
 		$writequeue->enqueue(\@info);
+		
+		&debug(2,"$line");
+		$reqpersec++ if $perfdata == 1; # Für Performance-Daten ausgabe
 	}
 	&stirb("[thread(parser)]: died unexpected!",2);
 }
 
-# Der Writer Thread schreibt eine Zeile in die entsprechende Logdatei.
-# Er hält immer die aktuelle Logdatei offen, und schließt sie, sobald eine
-# neue kommt.
+############
+# Writer:
+# Der Writer Thread schreibt einen Logdatei-String in die entsprechende Logdatei.
+# Er hält immer die aktuelle Logdatei offen, und schließt sie, sobald eine andere
+# benötigt wird. Die Logdatei wird ebenfalls alle $flush einmal geschlossen und 
+# erneut geöffnet, um eventuellen Verlusten vorzubeugen.
 sub writer
 {
 	&debug(3,"[debug(writer-thread)]: started.\n");
@@ -345,7 +376,7 @@ sub writer
 			my($path,$file) = split(/\/([^\/]+)$/, $fullpath); # Auf letzten / splitten
 			&checkpath($path);
 		
-			open($fileref,">>$fullpath") or die $!; # Neue Datei zum anhängen öffnen.
+			open($fileref,">>$fullpath") or &stirb($!,2); # Neue Datei zum anhängen öffnen.
 			$currentfile = $fullpath;
 		}
 		if($currentfile ne "" && $data ne "")
@@ -356,7 +387,7 @@ sub writer
 			{
 				$counter = 0;
 				close $fileref;
-				open($fileref,">>$fullpath") or die $!; # Neue Datei zum anhängen öffnen.
+				open($fileref,">>$fullpath") or &stirb($!,2); # Neue Datei zum anhängen öffnen.
 			}
 		}
 	}
@@ -367,7 +398,8 @@ sub perfdata
 {
 	while(1)
 	{
-		print STDERR "parsequeue: ".$parsequeue->pending.", writequeue: ".$writequeue->pending." items left.\n";
+		print STDERR $reqpersec." req/sec, parsequeue: ".$parsequeue->pending.", writequeue: ".$writequeue->pending." items left.\n";
+		$reqpersec = 0;
 		sleep 1;
 	}
 }
@@ -377,25 +409,22 @@ sub perfdata
 
 sub replacevars
 {
-	$line = shift;
-	($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
+	my $line = shift;
+	my $type = shift;
+	my $subdomain = shift;
+	my $domain = shift;
+	my ($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
 	$line =~ s/\?Y\?/$year/;			# Jahr
 	$line =~ s/\?M\?/$month/;			# Monat
 	$line =~ s/\?D\?/$day/;			# Tag
 	$line =~ s/\?h\?/$hour/;			# Stunde
 	$line =~ s/\?m\?/$minute/;			# Minute
 	$line =~ s/\?s\?/$second/;			# Sekunde
-	$line =~ s/\?pY\?/$pyear/;			# Paket-Jahr
-	$line =~ s/\?pM\?/$pmonth/;			# Paket-Monat
-	$line =~ s/\?pD\?/$pday/;			# Paket-Tag
-	$line =~ s/\?ph\?/$phour/;			# Paket-Stunde
-	$line =~ s/\?pm\?/$pminute/;			# Paket-Minute
-	$line =~ s/\?ps\?/$psecond/;			# Paket-Sekunde
 	$line =~ s/\?type\?/$type/;			# Typ
 	$line =~ s/\?subdomain\?/$subdomain/;	# Subdomain
 	$line =~ s/\?domain\?/$domain/;		# Domain
 	$line =~ s/\?host\?/$hostname/;		# Hostname des Systems
-	if(@rotatehours)
+	if($userotation == 1)
 	{
 		my $rot = &rotatenum($hour);
 		$line =~ s/\?rot\?/$rot/;
@@ -416,8 +445,8 @@ sub validaterotation
 
 sub rotatenum
 {
-	$hour = shift;
-	for($i = 0; $i <= $#rotatehours; $i++)
+	my $hour = shift;
+	for(my $i = 0; $i <= $#rotatehours; $i++)
 	{
 		if($hour < $rotatehours[$i] )
 		{
@@ -440,7 +469,7 @@ sub debug
 
 sub dt
 {
-        @localtime=localtime(time);
+        my @localtime=localtime(time);
         if ($_[0] eq 'year')
         {return $localtime[5]+1900}
         elsif ($_[0] eq 'month')
@@ -469,7 +498,7 @@ sub attachleading
 sub checkpath
 {
 	# Ordner erstellen, falls nicht vorhanden
-	$path = shift;
+	my $path = shift;
 	if(!-e $path)
 	{
 		system($mkdir.' -p '.$path);
@@ -511,7 +540,6 @@ sub exittsk
 {
 	# was passiert, wenn ein Signal empfangen wird
 	&syslog("Received Signal,... quitting.");
-	kill 2, $pid if $pid; # send INT to fork (tcpdump)
 	my @test = ("","");
 	$writequeue->enqueue(\@test); # Datei Schließen & writer beenden.
 	$writer->join; # Warten, bis sich writer beendet.
