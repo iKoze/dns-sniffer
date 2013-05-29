@@ -1,5 +1,5 @@
 #!/usr/bin/perl -w
-# dns-sniffer.pl von Florian Schiessl (10.10.2012)
+# dns-sniffer.pl von Florian Schießl (10.10.2012)
 #
 # Dieses Script loggt DNS-Anfragen in einer oder mehreren
 # Logdateien.
@@ -37,22 +37,45 @@
 # | ?rot?	| Rotation-Num	| sub rotatenum	|
 # +-------------+---------------+---------------+
 #
+# Exit-Codes:
+# 0: OK
+# 1: Konfigurations-Fehler
+# 2: Anderer Fehler
+# 
+# Quellen:
+# http://search.cpan.org/~rjbs/perl-5.16.3/pod/perlipc.pod
+# 
 # Changelog:
-# 11.10.2012:	Florian Schiessl:
+# 11.10.2012:	Florian Schießl:
 #		Script fertiggestellt
-# 12.10.2012:	Florian Schiessl:
+# 12.10.2012:	Florian Schießl:
 #		Variablen für nicht sub dt Stunde, Minute und
 #		Sekunde, Variablen für tcpdump Jahr, Monat und
 #		Tag eingebaut. Tcpdump-Pakete brauchen ca. 2-3
 #		Sekunden, bis sie in diesem Script übergeben
 #		werden.
+# 16.5.2013:	Florian Schießl:
+#		Möglichkeit eingebaut, das Script als daemon 
+#		zu starten.
+# 17.5.2013:	Florian Schießl:
+#		Sauberes beenden implementiert.
+# 21.5.2013:	Florian Schießl:
+#		Pidfile und startoptionen implementiert.
+# 23-24.5.2013:	Florian Schießl:
+#		Multithreading implementiert.
+#
 ##############################################################
 use Sys::Hostname;
+use POSIX "setsid";
+use Getopt::Long qw( :config no_ignore_case bundling );
+use threads;
+use Thread::Queue;
+use threads::shared;
 ##############################################################
 # Konfiguration
 #
 
-##############
+######################
 # Logrotate-Stunden
 # Zu welcher Stunde ?rot? um eins erhöht wird.
 # Auskommentieren, falls es nicht gebraucht wird.
@@ -61,40 +84,66 @@ use Sys::Hostname;
 ##############
 # Dateiname
 # Nicht vorhandene Dateien/Ordner werden automatisch erstellt
-my $filename = "/var/log/dns/?host?_?pY?-?pM?-?pD?.log";
+my $filename = "/var/log/dnstest/?host?_?Y?-?M?-?D?.log";
 
-##############
+#####################################
 # Dateiinhalt für eine DNS-Anfrage
-my $pattern = "?pY?-?pM?-?pD? ?ph?:?pm?:?ps? ?type? ?subdomain? ?domain?\n";
+my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain?\n";
 
-##############
+###############################
 # IP, auf der gelauscht wird
 my $listenip = "";
 
-##############
+######################################
 # Interface, auf dem gelauscht wird
 my $listenif = "eth0";
 
-##############
+########################################
 # wenn Subdomain leer, ersetzen durch
 my $nosubdomain = "";
 
-##############
+###################################################################
+# Falls benötigt, zusätzliche Parser Threads (einer läuft immer)
+my $extraparsers = 0;
+
+#####################################################################################
 # Debugging; 0 = nichts ausgeben; 1 = nur Fehler; 2 = Fehler & Anfragen; 3 = alles
 my $debug = 0;
 
-##############
+###########################################
+# Performance-Daten auf STDERR schreiben
+my $perfdata = 0;
+
+#############################################################
+# Alle x Schreibvorgänge Datei zurückschreiben (schließen)
+my $flush = 20;
+
+###################
 # Hilfsprogramme
 my $tcpdump = "tcpdump";		# Pfad zu tcpdump
 my $tcpdumpoptions = "-l";	# CentOS kompatibel machen ;-)
 my $mkdir = "mkdir";		# Pfad zu mkdir
+my $syslog = "logger";		# Pfad zu Syslog (Für Start/Stop Nachrichten)
 
 ##############################################################
 # Start
 #
 
+
 # Variablen belegen
+my $daemonize = 0; # 1 = Daemon; 0 = Normal
+my $pidfile = "";
+GetOptions(
+	'd|daemon' => \$daemonize,
+	'p|pidfile:s' => \$pidfile
+);
 my $hostname = hostname;
+my $parsequeue :shared = Thread::Queue->new();
+my $writequeue :shared = Thread::Queue->new();
+threads->new(\&perfdata)->detach if defined($perfdata) && $perfdata != 0;
+my $fileref;
+my $currentfile = "";
+
 # Konfiguration überprüfen
 if(@rotatehours)
 {
@@ -102,111 +151,226 @@ if(@rotatehours)
 	&validaterotation; # rotatehours Konfiguration validieren
 }
 
-my $execute = "$tcpdump $tcpdumpoptions -tttt -i $listenif dst port 53 and dst host $listenip 2>/dev/null |";
+# Starten
+my $execute = "$tcpdump $tcpdumpoptions -tttt -i $listenif dst port 53 and dst host $listenip";
 &debug(3,"[debug(execute)]: $execute\n");
-open INPUT, $execute or die "Can't open tcpdump. (Are you root?)";
-#open INPUT, "cat newdumpfile |" or die "Can't open tcpdump. (Are you root?)";
-while(<INPUT>)
+&daemonize if $daemonize == 1;
+my $pid;
+$pid = open(INPUT, "-|"); # Fork here
+defined($pid) or &stirb("Can't fork!", 2);
+
+if(!$pid)
 {
-	# Nur um auf Nummer Sicher zu gehen
-	undef $time;
-	undef $type;
-	undef $fqdn;
-	undef @fqdnparts;
-	undef $domain;
-	undef $subdomain;
-	undef $line;
-	
-	chomp; # Zeilenumbruch entfernen
-
-	# Ich versuche alles so genau wie möglich zu matchen,
-	# um keine falschen Daten zu bekommen. Alles was zu viel
-	# gematcht wurde entferne ich in den Schritten darauf.
-	# Beispiel Input String:
-	# "2012-10-10 15:48:10.182596 IP 193.254.174.37.53356 > ns2.trans.net.domain: 62986 [1au] A? ad.71i.de. (38)"
-
-	# Zeit extrahieren
-	if($_ =~ m/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+ IP /)
-	{
-		$datetime = $&; # "2012-10-10 15:48:10.182596 IP "
-		$datetime =~ s/\.[0-9]+ IP //; # "15:48:10"
-	}
-	else
-	{
-		&debug(1,"[errline(nodate)]: $_ \n");
-		next;
-	}
-	
-	# Typ extrahieren
-	if($_ =~ m/ [A-Z]+\? /)
-	{
-		$type = $&; # " A? "
-		$type =~ s/\? $//; # " A"
-		$type =~ s/^ //; # "A"
-	}
-	else
-	{
-		&debug(1,"[errline(notype)]: $_ \n");
-		next;
-	}
-	
-	# FQDN extrahieren
-	if($_ =~ m/\? .+\. \([0-9]+\)$/)
-	{
-		$fqdn = $&; # "? ad.71i.de. (38)"
-		$fqdn =~ s/^\? //; # "ad.71i.de. (38)"
-		$fqdn =~ s/\. \([0-9]+\)$//; # "ad.71i.de"
-		$fqdn = lc $fqdn; # die Gross-/Kleinschreibung von Domains interessiert niemanden
-	}
-	else
-	{
-		&debug(1,"[errline(nofqdn)]: $_ \n");
-		next;
-	}
-	
-	# Erste Aufbereitung fertig.
-
-	# Subdomain und Domain extrahieren.
-	@fqdnparts = split('\.',$fqdn); # den fqdn nach Punkten aufteilen
-	if($#fqdnparts > 1)
-	{
-		# Domain mit Subdomain
-		($subdomain,$domain) = split(/\.([^\.]+\.[^\.]+)$/, $fqdn); # auf dem vorletzten Punkt splitten
-	}
-	elsif($#fqdnparts == 1)
-	{
-		# Nur Domain enthalten
-		$domain = $fqdn;
-		$subdomain = $nosubdomain;
-	}
-	else
-	{
-		&debug(1,"[errline(invalidDomain)]: $_ \n");
-		next;
-	}
-	
-	# Jahr, Monat, Tag, Stunde, Minute, Sekunde aus den Paketen extrahieren.
-	($date,$time) = split(' ',$datetime);
-	($pyear,$pmonth,$pday) = split('-',$date);
-	($phour,$pminute,$psecond) = split(':',$time);
-
-	# Aufbereitung abgeschlossen, alle Text-Variablen mit Werten belegt
-	my $line = &replacevars($pattern);
-	
-	&debug(2,"$line");
-	
-	# An Datei anhängen
-	&attachfile(&replacevars($filename),$line);
+	# Child (tcpdump)
+	&debug(3,"[debug(child)]: started.\n");
+	#exec("sleep 300000");
+	exec($execute) or &stirb("Can't open tcpdump. (Are you root?)", 2);
 }
-close INPUT;
-exit 0;
 
+my $writer = threads->new(\&writer);
+
+threads->new(\&parser)->detach;
+for(my $i = 0; $i < $extraparsers; $i++)
+{
+	threads->new(\&parser)->detach;
+}
+
+&syslog("successfully started.");
+if($pidfile ne '')
+{
+	# Pidfile schreiben
+#	system($echo.' '.$$.' > '.$pidfile);
+	open(PIDFILE,">$pidfile") or die $!;
+	print PIDFILE $$;
+	close PIDFILE;
+	&syslog("pidfile '".$pidfile."' created");
+}
 # Catching Signals
 $SIG{INT} = \&exittsk;
 $SIG{TERM} = \&exittsk;
 $SIG{QUIT} = \&exittsk;
 $SIG{ABRT} = \&exittsk;
 $SIG{HUP} = \&exittsk;
+
+while(<INPUT>)
+{
+	# Alles was rein kommt den Parsern überlassen
+	$parsequeue->enqueue($_);
+}
+close INPUT;
+&stirb("end of INPUT (tcpdump died?)", 2);
+
+############
+# Threads
+
+# Der Parser Thread holt alle Infos aus einer tcpdump Eingabe und baut daraus
+# eine Zeile der Logdatei. Danach wird die Zeile dem Writer Thread übergeben.
+sub parser
+{
+	&debug(3,"[debug(parser-thread)]: started.\n");
+#	$SIG{INT} = sub 
+#	{
+#		&debug(3,"[thread(parser)]: exited.\n");
+#		threads->exit();
+#	};
+
+	while(my $_ = $parsequeue->dequeue())
+	{
+		# Nur um auf Nummer Sicher zu gehen
+		undef $time;
+		undef $type;
+		undef $fqdn;
+		undef @fqdnparts;
+		undef $domain;
+		undef $subdomain;
+		undef $line;
+	
+		chomp; # Zeilenumbruch entfernen
+
+		# Ich versuche alles so genau wie möglich zu matchen,
+		# um keine falschen Daten zu bekommen. Alles was zu viel
+		# gematcht wurde entferne ich in den Schritten darauf.
+		# Beispiel Input String:
+		# "2012-10-10 15:48:10.182596 IP 193.254.174.37.53356 > ns2.trans.net.domain: 62986 [1au] A? ad.71i.de. (38)"
+
+		# Zeit extrahieren
+		if($_ =~ m/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]+ IP /)
+		{
+			$datetime = $&; # "2012-10-10 15:48:10.182596 IP "
+			$datetime =~ s/\.[0-9]+ IP //; # "15:48:10"
+		}
+		else
+		{
+			&debug(1,"[errline(nodate)]: $_ \n");
+			next;
+		}
+	
+		# Typ extrahieren
+		if($_ =~ m/ [A-Z]+\? /)
+		{
+			$type = $&; # " A? "
+			$type =~ s/\? $//; # " A"
+			$type =~ s/^ //; # "A"
+		}
+		else
+		{
+			&debug(1,"[errline(notype)]: $_ \n");
+			next;
+		}
+	
+		# FQDN extrahieren
+		if($_ =~ m/\? .+\. \([0-9]+\)$/)
+		{
+			$fqdn = $&; # "? ad.71i.de. (38)"
+			$fqdn =~ s/^\? //; # "ad.71i.de. (38)"
+			$fqdn =~ s/\. \([0-9]+\)$//; # "ad.71i.de"
+			$fqdn = lc $fqdn; # die Gross-/Kleinschreibung von Domains interessiert niemanden
+		}
+		else
+		{
+			&debug(1,"[errline(nofqdn)]: $_ \n");
+			next;
+		}
+	
+		# Erste Aufbereitung fertig.
+
+		# Subdomain und Domain extrahieren.
+		@fqdnparts = split('\.',$fqdn); # den fqdn nach Punkten aufteilen
+		if($#fqdnparts > 1)
+		{
+			# Domain mit Subdomain
+			($subdomain,$domain) = split(/\.([^\.]+\.[^\.]+)$/, $fqdn); # auf dem vorletzten Punkt splitten
+		}
+		elsif($#fqdnparts == 1)
+		{
+			# Nur Domain enthalten
+			$domain = $fqdn;
+			$subdomain = $nosubdomain;
+		}
+		else
+		{
+			&debug(1,"[errline(invalidDomain)]: $_ \n");
+			next;
+		}
+	
+		# Jahr, Monat, Tag, Stunde, Minute, Sekunde aus den Paketen extrahieren.
+		($date,$time) = split(' ',$datetime);
+		($pyear,$pmonth,$pday) = split('-',$date);
+		($phour,$pminute,$psecond) = split(':',$time);
+
+		# Aufbereitung abgeschlossen, alle Text-Variablen mit Werten belegt
+		my $line = &replacevars($pattern);
+	
+		&debug(2,"$line");
+		
+		# An Writer übergeben
+		my @info = (&replacevars($filename),$line);
+		$writequeue->enqueue(\@info);
+	}
+	&stirb("[thread(parser)]: died unexpected!",2);
+}
+
+# Der Writer Thread schreibt eine Zeile in die entsprechende Logdatei.
+# Er hält immer die aktuelle Logdatei offen, und schließt sie, sobald eine
+# neue kommt.
+sub writer
+{
+	&debug(3,"[debug(writer-thread)]: started.\n");
+	my $currentfile = "";
+	my $fileref;
+	my $counter = 0;
+	while(my $inforef = $writequeue->dequeue())
+	{
+		my @info = @$inforef;
+		my $fullpath = $info[0];
+		my $data = $info[1];
+		if($fullpath eq "")
+		{
+			# Beenden Event.
+			close $fileref if $currentfile ne "";
+			
+			&debug(3,"[debug(writer-thread)]: closed file '".$currentfile."' and quitted.\n");
+			$currentfile = "";
+			threads->exit(0);
+		}
+		elsif($fullpath ne $currentfile)
+		{
+			# Datei hat sich geändert.
+			&debug(3,"[debug(writer-thread)]: filechange to: '".$fullpath."'\n");
+			
+			close $fileref if $currentfile ne ""; # Alte Datei schließen, falls geöffnet.
+			$currentfile = "";
+
+			# Ordner erstellen, falls noch nicht vorhanden
+			my($path,$file) = split(/\/([^\/]+)$/, $fullpath); # Auf letzten / splitten
+			&checkpath($path);
+		
+			open($fileref,">>$fullpath") or die $!; # Neue Datei zum anhängen öffnen.
+			$currentfile = $fullpath;
+		}
+		if($currentfile ne "" && $data ne "")
+		{
+			print $fileref $data; # Datensatz in Datei schreiben.
+			++$counter;
+			if($counter == $flush)
+			{
+				$counter = 0;
+				close $fileref;
+				open($fileref,">>$fullpath") or die $!; # Neue Datei zum anhängen öffnen.
+			}
+		}
+	}
+	&stirb("[thread(writer)]: died unexpected!",2);
+}
+
+sub perfdata
+{
+	while(1)
+	{
+		print STDERR "parsequeue: ".$parsequeue->pending.", writequeue: ".$writequeue->pending." items left.\n";
+		sleep 1;
+	}
+}
 
 #########
 # Subs
@@ -215,19 +379,19 @@ sub replacevars
 {
 	$line = shift;
 	($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
-	$line =~ s/\?Y\?/$year/;		# Jahr
-	$line =~ s/\?M\?/$month/;		# Monat
+	$line =~ s/\?Y\?/$year/;			# Jahr
+	$line =~ s/\?M\?/$month/;			# Monat
 	$line =~ s/\?D\?/$day/;			# Tag
-	$line =~ s/\?h\?/$hour/;		# Stunde
-	$line =~ s/\?m\?/$minute/;		# Minute
-	$line =~ s/\?s\?/$second/;		# Sekunde
-	$line =~ s/\?pY\?/$pyear/;		# Paket-Jahr
-	$line =~ s/\?pM\?/$pmonth/;		# Paket-Monat
-	$line =~ s/\?pD\?/$pday/;		# Paket-Tag
-	$line =~ s/\?ph\?/$phour/;		# Paket-Stunde
-	$line =~ s/\?pm\?/$pminute/;		# Paket-Minute
-	$line =~ s/\?ps\?/$psecond/;		# Paket-Sekunde
-	$line =~ s/\?type\?/$type/;		# Typ
+	$line =~ s/\?h\?/$hour/;			# Stunde
+	$line =~ s/\?m\?/$minute/;			# Minute
+	$line =~ s/\?s\?/$second/;			# Sekunde
+	$line =~ s/\?pY\?/$pyear/;			# Paket-Jahr
+	$line =~ s/\?pM\?/$pmonth/;			# Paket-Monat
+	$line =~ s/\?pD\?/$pday/;			# Paket-Tag
+	$line =~ s/\?ph\?/$phour/;			# Paket-Stunde
+	$line =~ s/\?pm\?/$pminute/;			# Paket-Minute
+	$line =~ s/\?ps\?/$psecond/;			# Paket-Sekunde
+	$line =~ s/\?type\?/$type/;			# Typ
 	$line =~ s/\?subdomain\?/$subdomain/;	# Subdomain
 	$line =~ s/\?domain\?/$domain/;		# Domain
 	$line =~ s/\?host\?/$hostname/;		# Hostname des Systems
@@ -260,16 +424,18 @@ sub rotatenum
 			return $i;
 		}
 	}
-	die "\@rotatehours ist falsch Konfiguriert! (Es muss einen Wert >= 24 enthalten.)";
+	&stirb("\@rotatehours ist falsch Konfiguriert! (Es muss einen Wert >= 24 enthalten.)",1);
 }
 
 sub debug
 {
-	$level = shift;
+	my $level = shift;
+	my $message = shift;
 	if($debug >= $level)
 	{
-		print shift;
+		print STDERR $message;
 	}
+	&syslog($message) if $level == 3;
 }
 
 sub dt
@@ -300,18 +466,6 @@ sub attachleading
         return $string;
 }
 
-sub attachfile
-{
-	my $fullpath = shift;
-	my($path,$file) = split(/\/([^\/]+)$/, $fullpath); # Auf letzten / splitten
-	&debug(3,"[file]: $fullpath\n");
-	&checkpath($path); # Ordner erstellen, falls noch nicht vorhanden
-	my $data = shift;
-	open(FILE,">>$fullpath") or die $!;
-	print FILE $data;
-	close FILE;
-}
-
 sub checkpath
 {
 	# Ordner erstellen, falls nicht vorhanden
@@ -323,10 +477,50 @@ sub checkpath
 	}
 }
 
+sub daemonize
+{
+	&debug(3,"daemonizing...\n");
+	chdir("/") || &stirb("can't chdir to /: $!",2);
+	open(STDIN, "< /dev/null") || &stirb("can't read /dev/null: $!",2);
+	open(STDOUT, "> /dev/null") || &stirb("can't write to /dev/null: $!",2); # Siehe hier.
+	defined(my $pid = fork()) || &stirb("can't fork: $!",2);
+	exit if $pid; # non-zero now means I am the parent
+	(setsid() != -1) || &stirb("Can't start a new session: $!",2);
+	open(STDERR, ">&STDOUT") || &stirb("can't dup stdout: $!",2);
+	&debug(3,"done\n"); # Sollte nicht mehr ausgegeben werden!
+}
+
+sub stirb
+{
+	my $message = shift;
+	my $code = shift;
+	$message = "Configuration-Error: ".$message if $code == 1;
+	$message = "ERROR: ".$message if $code == 2;
+	&syslog($message);
+	print $message."\n";
+	exit $code;
+}
+
+sub syslog
+{
+	my $message = shift;
+	system($syslog.' "[DNS-Sniffer]: '.$message.'"');
+}
+
 sub exittsk
 {
 	# was passiert, wenn ein Signal empfangen wird
-	close INPUT;
+	&syslog("Received Signal,... quitting.");
+	kill 2, $pid if $pid; # send INT to fork (tcpdump)
+	my @test = ("","");
+	$writequeue->enqueue(\@test); # Datei Schließen & writer beenden.
+	$writer->join; # Warten, bis sich writer beendet.
+	if($pidfile ne '')
+	{
+		unlink($pidfile);
+		&debug(3,"[pidfile(removed)]: '".$pidfile."'\n");
+	}
+	&syslog("ended gracefully.");
 	exit 0;
 }
 
