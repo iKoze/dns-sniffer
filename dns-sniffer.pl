@@ -141,8 +141,8 @@ GetOptions(
 	'p|pidfile:s' => \$pidfile
 );
 my $hostname = hostname;
-my $parsequeue :shared = Thread::Queue->new();
-my $writequeue :shared = Thread::Queue->new();
+my $parsequeue = Thread::Queue->new();
+my $writequeue = Thread::Queue->new();
 threads->new(\&perfdata)->detach if defined($perfdata) && $perfdata != 0;
 my $fileref;
 my $currentfile = "";
@@ -155,7 +155,7 @@ if($userotation == 1)
 }
 
 # Starten
-my $execute = "$tcpdump $tcpdumpoptions -tttt -i $listenif dst port 53 and dst host $listenip";
+my $execute = "$tcpdump $tcpdumpoptions -n -tttt -i $listenif dst port 53 and dst host $listenip";
 &debug(3,"[debug(execute)]: $execute\n");
 &daemonize if $daemonize == 1;
 my $pid;
@@ -251,7 +251,7 @@ sub parser
 		{
 			$src_ip = $&;
 			$src_ip =~ s/ IP //;
-			$src_ip =~ s/\.\$//;
+			$src_ip =~ s/\.$//;
 		}
 		else
 		{
