@@ -315,12 +315,12 @@ sub parser
 		my @replacedata = ($type, $subdomain, $domain, $src_ip, $pyear, $pmonth, $pday, $phour, $pminute, $psecond);
 
 		# Aufbereitung abgeschlossen, alle Text-Variablen mit Werten belegt
-		my $line = &replacevars($pattern);
+		my $line = &replacevars($pattern, @replacedata);
 	
 		&debug(2,"$line");
 		
 		# An Writer übergeben
-		my @info = (&replacevars($filename),$line);
+		my @info = (&replacevars($filename, @replacedata),$line);
 		$writequeue->enqueue(\@info);
 	}
 	&stirb("[thread(parser)]: died unexpected!",2);
