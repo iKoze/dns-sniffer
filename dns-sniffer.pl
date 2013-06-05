@@ -23,9 +23,10 @@
 # | ?h?		| Stunde	| sub dt	|
 # | ?m?		| Minute	| sub dt	|
 # | ?s?		| Sekunde	| sub dt	|
-# | ?type?	| Typ(A,MX,...)	| tcpdump	|
-# | ?subdomain?	| Subdomain	| tcpdump	|
-# | ?domain?	| Domain	| tcpdump	|
+# | ?type?	| Typ(A,MX,...)	| Net::PcapUtils|
+# | ?subdomain?	| Subdomain	| Net::PcapUtils|
+# | ?domain?	| Domain	| Net::PcapUtils|
+# | ?srcip?	| Quell-IP	| Net::PcapUtils|
 # | ?host?	| Hostname	| Sys::Hostname	|
 # | ?rot?	| Rotation-Num	| sub rotatenum	|
 # +-------------+---------------+---------------+
@@ -95,7 +96,7 @@ my $filename = "/var/log/dnstest/?host?_?Y?-?M?-?D?.log";
 
 #####################################
 # Dateiinhalt für eine DNS-Anfrage
-my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain?\n";
+my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain? ?srcip?\n";
 
 ########################################
 # wenn Subdomain leer, ersetzen durch
@@ -227,6 +228,7 @@ sub parser
 	{
 		my $type;
 		my $fqdn;
+		my $src_ip;
 		
 		##########################
 		# Das Paket verarbeiten
@@ -270,6 +272,9 @@ sub parser
 					# DNS-Paket aus Datenteil erzeugen
 					$dnspacket = Net::DNS::Packet->new(\$udp_frame->{data});
 				}
+				
+				# Quell-IP
+				$src_ip = $ip_frame->{src_ip};
 			}
 			
 			
@@ -322,11 +327,11 @@ sub parser
 		# Aufbereitung abgeschlossen.
 		
 		# Einen String für die Logdatei anhand des Musters ($pattern) erstellen
-		my $line = &replacevars($pattern, $type, $subdomain, $domain);
+		my $line = &replacevars($pattern, $type, $subdomain, $domain, $src_ip);
 		
 		# Info für die Schreibwarteschlange ($writequeue) erstellen
 		my @info;
-		$info[0] = &replacevars($filename, $type, $subdomain, $domain); # Dateiname
+		$info[0] = &replacevars($filename, $type, $subdomain, $domain, $src_ip); # Dateiname
 		$info[1] = $line; # Logdatei-String
 		
 		# Info für Writer in Schreibwarteschlange stecken.
@@ -413,6 +418,7 @@ sub replacevars
 	my $type = shift;
 	my $subdomain = shift;
 	my $domain = shift;
+	my $src_ip = shift;
 	my ($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
 	$line =~ s/\?Y\?/$year/;			# Jahr
 	$line =~ s/\?M\?/$month/;			# Monat
@@ -423,6 +429,7 @@ sub replacevars
 	$line =~ s/\?type\?/$type/;			# Typ
 	$line =~ s/\?subdomain\?/$subdomain/;	# Subdomain
 	$line =~ s/\?domain\?/$domain/;		# Domain
+	$line =~ s/\?srcip\?/$src_ip/;		# Quell-IP
 	$line =~ s/\?host\?/$hostname/;		# Hostname des Systems
 	if($userotation == 1)
 	{
