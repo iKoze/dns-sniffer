@@ -33,6 +33,7 @@
 # | ?type?	| Typ(A,MX,...)	| tcpdump	|
 # | ?subdomain?	| Subdomain	| tcpdump	|
 # | ?domain?	| Domain	| tcpdump	|
+# | ?srcip?	| Quell-IP	| tcpdump	|
 # | ?host?	| Hostname	| Sys::Hostname	|
 # | ?rot?	| Rotation-Num	| sub rotatenum	|
 # +-------------+---------------+---------------+
@@ -63,8 +64,10 @@
 #		Pidfile und startoptionen implementiert.
 # 23-24.5.2013:	Florian Schießl:
 #		Multithreading implementiert.
-#
+# 5.6.2013:	Florian Schießl:
+#		Quell-IP zu Variablen hinzugefügt.
 ##############################################################
+use strict;
 use Sys::Hostname;
 use POSIX "setsid";
 use Getopt::Long qw( :config no_ignore_case bundling );
@@ -78,8 +81,8 @@ use threads::shared;
 ######################
 # Logrotate-Stunden
 # Zu welcher Stunde ?rot? um eins erhöht wird.
-# Auskommentieren, falls es nicht gebraucht wird.
-#my @rotatehours = (6,12,18,24); # Muss 24 enthalten!
+my $userotation = 0; # 1 = Rotation benutzen, 0 = nicht.
+my @rotatehours = (6,12,18,24); # Muss 24 enthalten!
 
 ##############
 # Dateiname
@@ -88,7 +91,7 @@ my $filename = "/var/log/dnstest/?host?_?Y?-?M?-?D?.log";
 
 #####################################
 # Dateiinhalt für eine DNS-Anfrage
-my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain?\n";
+my $pattern = "?Y?-?M?-?D? ?h?:?m?:?s? ?type? ?subdomain? ?domain? ?srcip?\n";
 
 ###############################
 # IP, auf der gelauscht wird
@@ -145,7 +148,7 @@ my $fileref;
 my $currentfile = "";
 
 # Konfiguration überprüfen
-if(@rotatehours)
+if($userotation == 1)
 {
 	@rotatehours = sort {$a <=> $b} (@rotatehours); # Rotations-Stunden Numerisch aufsteigend sortieren
 	&validaterotation; # rotatehours Konfiguration validieren
@@ -216,14 +219,12 @@ sub parser
 
 	while(my $_ = $parsequeue->dequeue())
 	{
-		# Nur um auf Nummer Sicher zu gehen
-		undef $time;
-		undef $type;
-		undef $fqdn;
-		undef @fqdnparts;
-		undef $domain;
-		undef $subdomain;
-		undef $line;
+		my $datetime;
+		my $type;
+		my $fqdn;
+		my $domain;
+		my $subdomain;
+		my $src_ip;
 	
 		chomp; # Zeilenumbruch entfernen
 
@@ -244,7 +245,20 @@ sub parser
 			&debug(1,"[errline(nodate)]: $_ \n");
 			next;
 		}
-	
+		
+		# Quell-IP extrahieren
+		if($_ =~ m/ IP [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\./)
+		{
+			$src_ip = $&;
+			$src_ip =~ s/ IP //;
+			$src_ip =~ s/\.\$//;
+		}
+		else
+		{
+			&debug(1,"[errline(noip)]: $_ \n");
+			next;
+		}
+		
 		# Typ extrahieren
 		if($_ =~ m/ [A-Z]+\? /)
 		{
@@ -275,7 +289,7 @@ sub parser
 		# Erste Aufbereitung fertig.
 
 		# Subdomain und Domain extrahieren.
-		@fqdnparts = split('\.',$fqdn); # den fqdn nach Punkten aufteilen
+		my @fqdnparts = split('\.',$fqdn); # den fqdn nach Punkten aufteilen
 		if($#fqdnparts > 1)
 		{
 			# Domain mit Subdomain
@@ -294,9 +308,11 @@ sub parser
 		}
 	
 		# Jahr, Monat, Tag, Stunde, Minute, Sekunde aus den Paketen extrahieren.
-		($date,$time) = split(' ',$datetime);
-		($pyear,$pmonth,$pday) = split('-',$date);
-		($phour,$pminute,$psecond) = split(':',$time);
+		my ($date,$time) = split(' ',$datetime);
+		my ($pyear,$pmonth,$pday) = split('-',$date);
+		my ($phour,$pminute,$psecond) = split(':',$time);
+
+		my @replacedata = ($type, $subdomain, $domain, $src_ip, $pyear, $pmonth, $pday, $phour, $pminute, $psecond);
 
 		# Aufbereitung abgeschlossen, alle Text-Variablen mit Werten belegt
 		my $line = &replacevars($pattern);
@@ -377,8 +393,18 @@ sub perfdata
 
 sub replacevars
 {
-	$line = shift;
-	($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
+	my $line = shift;
+	my $type = shift;
+	my $subdomain = shift;
+	my $domain = shift;
+	my $src_ip = shift;
+	my $pyear = shift;
+	my $pmonth = shift;
+	my $pday = shift;
+	my $phour = shift;
+	my $pminute = shift;
+	my $psecond = shift;
+	my ($year,$month,$day,$hour,$minute,$second)=(&dt('year'),&dt('month'),&dt('day'),&dt('hour'),&dt('minute'),&dt('second'));
 	$line =~ s/\?Y\?/$year/;			# Jahr
 	$line =~ s/\?M\?/$month/;			# Monat
 	$line =~ s/\?D\?/$day/;			# Tag
@@ -394,8 +420,9 @@ sub replacevars
 	$line =~ s/\?type\?/$type/;			# Typ
 	$line =~ s/\?subdomain\?/$subdomain/;	# Subdomain
 	$line =~ s/\?domain\?/$domain/;		# Domain
+	$line =~ s/\?srcip\?/$src_ip/;		# Quell-IP
 	$line =~ s/\?host\?/$hostname/;		# Hostname des Systems
-	if(@rotatehours)
+	if($userotation == 1)
 	{
 		my $rot = &rotatenum($hour);
 		$line =~ s/\?rot\?/$rot/;
@@ -416,8 +443,8 @@ sub validaterotation
 
 sub rotatenum
 {
-	$hour = shift;
-	for($i = 0; $i <= $#rotatehours; $i++)
+	my $hour = shift;
+	for(my $i = 0; $i <= $#rotatehours; $i++)
 	{
 		if($hour < $rotatehours[$i] )
 		{
@@ -440,7 +467,7 @@ sub debug
 
 sub dt
 {
-        @localtime=localtime(time);
+        my @localtime=localtime(time);
         if ($_[0] eq 'year')
         {return $localtime[5]+1900}
         elsif ($_[0] eq 'month')
@@ -469,7 +496,7 @@ sub attachleading
 sub checkpath
 {
 	# Ordner erstellen, falls nicht vorhanden
-	$path = shift;
+	my $path = shift;
 	if(!-e $path)
 	{
 		system($mkdir.' -p '.$path);
