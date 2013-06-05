@@ -62,6 +62,8 @@
 # 28.5.2013:	Florian Schießl:
 #		Optimierungen und Ausgabe der Anfragen/sec in 
 #		den Performance-Daten
+# 5.6.2013:	Florian Schießl:
+#		Quell-IP zu Variablen hinzugefügt.
 ##############################################################
 use strict; # Guter Stil
 use Try::Tiny; # Error-Catching
