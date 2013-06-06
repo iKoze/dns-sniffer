@@ -64,6 +64,8 @@
 #		den Performance-Daten
 # 5.6.2013:	Florian Schießl:
 #		Quell-IP zu Variablen hinzugefügt.
+# 6.6.2013:	Florian Schießl:
+#		Verloren gegangenes lc $fqdn wieder eingefügt.
 ##############################################################
 use strict; # Guter Stil
 use Try::Tiny; # Error-Catching
@@ -288,6 +290,7 @@ sub parser
 			$type = $dnsquestion->qtype;
 			# FQDN extrahieren
 			$fqdn = $dnsquestion->qname;
+			$fqdn = lc $fqdn; # die Gross-/Kleinschreibung von Domains interessiert niemanden
 		}
 		catch
 		{
